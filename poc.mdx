@@ -1,0 +1,346 @@
+# Gmail Otomasyon POC: Mail İşleme ve Otomatik Cevap
+
+## Problem
+   Mevcut sistem, Gmail'e gelen mailleri otomatik olarak işleyemiyor ve kullanıcıların belirli kriterlere göre (konu, gönderen, içerik vb.) otomatik cevaplar göndermesini sağlayamıyor. Örnek: "makromusic" konulu maillere otomatik yanıt gönderilemiyor.
+
+## İş Etkisi
+   Gmail API'si ile entegre bir otomasyon sistemi, kullanıcıların gelen mailleri hızla işlemesini ve uygun cevaplar göndermesini sağlayabilir. Bu, aşağıdaki olumlu sonuçları doğurabilir:
+   * Müşteri memnuniyetinde artış: Taleplere hızlı ve otomatik yanıtlar gönderilerek müşteri memnuniyeti artırılabilir.
+   * Operasyonel verimlilik: Manuel mail işleme süreçleri azaltılarak ekip verimliliği artırılabilir.
+   * Kişiselleştirilmiş iletişim: Gönderenin bilgilerine göre özelleştirilmiş cevaplar gönderilebilir.
+   * Zaman tasarrufu: Tekrarlayan mail işlemleri otomatikleştirilerek ekip üyelerinin zamanı daha verimli kullanılabilir.
+
+## Risk & Limitler
+ 1. Performans sınırlamaları: Gmail API'nin günlük kullanım limitleri aşıldığında performans düşüşü yaşanabilir.
+ 2. Veri güvenliği: Otomatik cevaplama sistemi, hassas bilgiler içeren mailleri yanlışlıkla işleyebilir veya yanıtlayabilir. Bu nedenle filtreleme ve denetim mekanizmaları önemlidir.
+ 3. Maliyet: Yüksek hacimli mail trafiği için Google Cloud hizmetlerinin maliyeti artabilir.
+
+# Process
+Bir Google hesabına gelen mailleri işlemeyi, gerekli kontrolleri sağlayıp nasıl otomatik bir cevap döndüğümüzü bu şekilde başlıklar altında açıklayabiliriz.
+
+
+## API Auth
+
+Gmail API'sine erişim sağlamak için Google Cloud üzerinden oluşturulur. Bu bilgiler, credentials.json dosyasında saklanır
+
+### getOAuthConfig Fonksiyonu
+
+Bu fonksiyon, Google Cloud üzerinde oluşturulan proje kimlik bilgilerini credentials.json dosyasından okur ve bu bilgiler kullanılarak OAuth 2.0 konfigürasyonu hazırlanır.
+
+```go
+func getOAuthConfig() *oauth2.Config {
+    // credentials environment değişkeni ile credentials.json dosyasının yolu alınır
+    credentialsFile := os.Getenv(credentials)
+    if credentialsFile == "" {
+        credentialsFile = "environments/credentials.json"
+    }
+
+    creds, err := os.ReadFile(credentialsFile)
+    if err != nil {
+        log.Fatalf("Credentials file not readable err %v", err)
+    }
+
+    // Google OAuth 2.0 konfigürasyonu oluşturulur
+    config, err := google.ConfigFromJSON(
+        creds,
+        gmail.GmailReadonlyScope,  // Gmail okuma izni
+        gmail.GmailModifyScope,    // Gmail değiştirme izni
+        gmail.GmailSendScope,      // Gmail gönderme izni
+    )
+    if err != nil {
+        log.Fatalf("OAuth config not created err%v", err)
+    }
+    return config
+}
+```
+
+## getToken Fonksiyonu
+
+Fonksiyon, kullanıcı etkileşimiyle alınan OAuth token'ını yönetir.
+
+```go
+func getToken(config *oauth2.Config) *oauth2.Token {
+    if _, err := os.Stat(tokenFile); err == nil {
+        token, err := loadToken(tokenFile)
+        if err == nil {
+            return token
+        }
+    }
+
+    // Lazımsa kullanıcıya token alması için yönlendirme
+    authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+    fmt.Printf("Open this URL and give the access code \n%v\n", authURL)
+
+    // Yönlendirdikten sonra gerekli kod
+    var authCode string
+    fmt.Print("Access Code: ")
+    if _, err := fmt.Scan(&authCode); err != nil {
+        log.Fatalf("Code not readable %v", err)
+    }
+
+    // Token oluşturma
+    token, err := config.Exchange(context.TODO(), authCode)
+    if err != nil {
+        log.Fatalf("Token err %v", err)
+    }
+
+    saveToken(tokenFile, token)
+    return token
+}
+```
+> Hali hazırda oluşturulmuş bir token file var ise bunu **_loadToken_** fonksiyonu ile okur.
+
+
+
+```go
+func loadToken(file string) (*oauth2.Token, error) {
+    f, err := os.Open(file)
+    if err != nil {
+        return nil, err
+    }
+    defer f.Close()
+    tok := &oauth2.Token{}
+    err = json.NewDecoder(f).Decode(tok)
+    return tok, err
+}
+```
+
+## Mail Işleme Akışı (Mail Processing)
+
+### 1. Gelen Maillerin Çekilmesi
+
+Gmail API'si kullanılarak kullanıcının gelen kutusundaki okunmamış mailler çekilir. Bu işlem, `service.Users.Messages.List` fonksiyonu ile gerçekleştirilir. Aşağıdaki parametreler kullanılır: _**[Document](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list)**_
+
+> **Q** **parametresi**: Filtreleme yapmak için kullanılır. Örneğin, is:unread ile sadece okunmamış mailler çekilir.
+
+> **Do** **fonksiyonu**: Sorguyu çalıştırır ve sonuçları döndürür.
+
+```go
+messages, err := service.Users.Messages.List("me").Q("is:unread").Do()
+if err != nil {
+    return fmt.Errorf("messages are not readable %v", err)
+}
+```
+
+#### Önemli Noktalar:
+
+* **`is:unread:`** Sadece okunmamış mailleri çeker.
+* `messages.List`: Çekilen maillerin listesini içerir. Her bir mail, bir Message objesi olarak temsil edilir.
+
+
+## Mail İçeriğinin Analizi
+
+Çekilen her bir mailin içeriği analiz edilir. Bu analiz, mailin body'sinin decode edilmesi ve belirli anahtar kelimelerin aranmasını ile olur.
+
+### 2.1. Mail Body'sinin Decode Edilmesi
+
+Gmail API mail body'sini base64 formatında döndürür. Bundan dolayı maili okumak için base64 decode işlemi yapılır.
+
+```go
+func decodeEmail(email *gmail.Message) string {
+    var body string
+
+    // mail body'sini decode et
+    if email.Payload.Body != nil && email.Payload.Body.Data != "" {
+        data, err := base64.URLEncoding.DecodeString(email.Payload.Body.Data)
+        if err == nil {
+            return string(data)
+        }
+    }
+
+    // body boşsa, alternatif kısımları kontrol et
+    if email.Payload.Parts != nil {
+        for _, part := range email.Payload.Parts {
+            if part.MimeType == "text/plain" && part.Body != nil {
+                data, err := base64.URLEncoding.DecodeString(part.Body.Data)
+                if err != nil {
+                    log.Printf("Body decode err %v", err)
+                    continue
+                }
+                body += string(data)
+            }
+        }
+    }
+
+    return body
+}
+```
+
+### 2.2. Keyword Kontrolü
+
+Mail body'si içinde belirli bir anahtar kelimenin ("makromusic") olup olmadığı kontrol edilir.
+
+```go
+func shouldReply(email *gmail.Message) bool {
+    body := extractEmailBody(email)
+    return strings.Contains(strings.ToLower(body), strings.ToLower(targetKeyword))
+}
+```
+
+## Otomatik Cevap Gönderme
+
+Belirli kriterlere uyan maillere otomatik cevap gönderilir. Bu işlem, `service.Users.Messages.Send` fonksiyonu ile gerçekleştirilir. **_[Document](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/send)_**
+
+### 3.1. Cevap Mailinin Oluşturulması
+
+Cevap maili, gönderenin bilgilerine göre kişiselleştirilir. Gönderenin adı ve mail konusu kullanılarak bir cevap metni oluşturulur. (Diğer örneklerde bu şekilde bir yönteme gidildiği için böyle bir yapı tercih edildi.)
+
+```go
+func sendReply(service *gmail.Service, email *gmail.Message) error {
+var from string
+var subject string
+
+// Gönderen ve konu bilgilerini çıkar
+for _, header := range email.Payload.Headers {
+if header.Name == "From" {
+from = header.Value
+}
+if header.Name == "Subject" {
+subject = header.Value
+}
+}
+
+// Cevap mailini oluştur
+messageStr := fmt.Sprintf(
+"From: me\r\n"+
+"To: %s\r\n"+ /
+"Subject: Re: %s\r\n"+
+"Content-Type: text/plain; charset=UTF-8\r\n\r\n"+
+"Merhaba,\n\n"+
+"Mesajınızı aldık. 'makromusic' ile ilgili talebiniz en kısa sürede incelenecektir.\n\n"+
+"Teşekkürler,\n"+
+"makromusic ekibi",
+from, // Gönderenin mail adresi direkt kullanılıyor
+subject,
+)
+
+// Cevap mailini gönder
+message := &gmail.Message{
+Raw:      base64.URLEncoding.EncodeToString([]byte(messageStr)),
+ThreadId: email.ThreadId,
+}
+
+_, err := service.Users.Messages.Send("me", message).Do()
+return err
+}
+```
+
+### 3.2. Mail Başlıklarının Çıkarılması
+Bu kod bloğu, gelen mailin başlıklarını **(Headers)** dolaşarak gönderenin bilgilerini **(From)** ve mail konusunu (Subject) çıkarır.
+
+```go
+for _, header := range email.Payload.Headers {
+    if header.Name == "From" {
+        from = header.Value
+    }
+    if header.Name == "Subject" {
+        subject = header.Value
+    }
+}
+```
+
+* `email.Payload.Headers:` Gelen mailin başlık bilgilerini içeren bir dizi (slice). Her bir başlık, Name ve Value alanlarına sahiptir.
+* `From`: Gönderenin mail adresi ve ismi. Örneğin: "Efekan <efekan@mail.com>".
+* `Subject:` Mailin konusu. Örneğin: "makromusic hakkında bilgi".
+
+Bu bilgiler, otomatik cevap mailini kişiselleştirmek için kullanılır.
+
+## Mail Durumunun Güncellenmesi
+Otomatik cevap gönderildikten sonra mail durumu güncellenir. Bu işlem, `service.Users.Messages.Modify`  ile yapılır. **_[Document](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/modify)_**
+
+```go
+func markAsRead(service *gmail.Service, messageID string) {
+    _, err := service.Users.Messages.Modify("me", messageID, &gmail.ModifyMessageRequest{
+        RemoveLabelIds: []string{"UNREAD"},
+    }).Do()
+    if err != nil {
+        fmt.Println("err")
+    }
+}
+```
+
+## Main Process
+Tüm bu logic, gelen maillerin işlenmesi ve otomatik cevapların gönderilmesi için bir araya getirilir.
+
+### 5.1. Okunmamış Maillerin Çekilmesi
+Gmail API'si kullanılarak kullanıcının gelen kutusundaki okunmamış mailler (`is:unread`, yukarıda bahsedilmiştir) çekilir.
+```go
+func processEmails(service *gmail.Service) error {
+    // Okunmamış mailleri çek
+    messages, err := service.Users.Messages.List("me").Q("is:unread").Do()
+    if err != nil {
+        return fmt.Errorf("messages are not readable %v", err)
+    }
+
+```
+### 5.2. Her Bir Mailin İşlenmesi
+Çekilen her bir mail, aşağıdaki adımlarla işlenir:
+
+#### 5.2.1. Mail Detaylarının Alınması
+Bu işlem, `service.Users.Messages.Get` ile yapılır. **_[Document](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/get)_**
+```go
+email, err := service.Users.Messages.Get("me", msg.Id).Format("full").Do()
+if err != nil {
+log.Printf("%s Id message not get %v", msg.Id, err)
+continue
+}
+```
+* `msg.Id:` Mail ID.
+* `Format("full"):` Mailin tam içeriğini _(body, headers, vs.)_ alır.
+
+#### 5.2.2. Mail İçeriğinin Analizi
+
+Mail içeriği analiz edilir ve belirli bir anahtar kelime _("makromusic")_ içerip içermediği kontrol edilir.
+```go
+if shouldReply(email) {
+    log.Printf("'%s' keyword founded sending...", targetKeyword)
+    if err := sendReply(service, email); err != nil {
+        log.Printf("%s Id of message not posted %v", msg.Id, err)
+        continue
+    }
+    log.Printf("%s Id of message sended message", msg.Id)
+    markAsRead(service, msg.Id)
+}
+```
+* `shouldReply(email):` Mailin belirli bir anahtar kelime içerip içermediğini kontrol eder.
+* `sendReply(service, email):` Maili cevaplar.
+* `markAsRead(service, msg.Id):` Maili "okundu" olarak işaretler.
+
+### 5.3. Main Fonksiyonu
+
+Aşağıda verilen main fonksiyonunun işleyişi şu şekildedir:
+
+* Script çalıştırıldığında, OAuth 2.0 kimlik doğrulama işlemi başlar. 
+* Gmail API'si için bir servis oluşturulur. 
+* processEmails fonksiyonu çağrılarak okunmamış mailler işlenir.
+
+Mail İşleme İşlemi:
+* Okunmamış mailler çekilir.
+* Her bir mail analiz edilir ve "makromusic" anahtar kelimesi içeriyorsa otomatik cevap gönderilir.
+* İşlem tamamlandığında script sonlandırılır.
+
+```go
+func main() {
+	ctx := context.Background()
+	config := getOAuthConfig()
+
+	fmt.Println("Gmail OAuth process...")
+	token := getToken(config)
+
+	fmt.Println("Gmail service...")
+	service, err := gmail.NewService(ctx, option.WithTokenSource(config.TokenSource(ctx, token)))
+	if err != nil {
+		log.Fatalf("Gmail service error %v", err)
+	}
+
+	fmt.Println("Email process starts")
+	if err := processEmails(service); err != nil {
+		log.Fatalf("Email process err %v", err)
+	}
+
+	fmt.Println("Email processing completed successfully")
+}
+```
+
+## Diagram
+
